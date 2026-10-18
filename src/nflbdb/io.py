@@ -1,14 +1,18 @@
-"""Loaders for the NFL Big Data Bowl 2027 data (parquet produced by scripts/download_data.py).
+"""Loaders for the processed BDB 2027 parquet (built by scripts/download_data.py).
 
-Tables
-------
-players                 510 rows   nfl_id            draft info, position, college
-combine_results         510 rows   nfl_id            40, shuttle, 3-cone, jumps, NGS scores
-player_career_successes 510 rows   nfl_id            snaps, games, starts, All-Pro, Pro Bowl
-combine_tracking        463k rows  event_id,nfl_id   10 Hz Combine drills (no `o` column)
-games                   1,002 rows game_id
-player_play             316k rows  game_id,play_id,nfl_id   per-snap NGS metrics, play_direction
-game_tracking_{season}  ~9M rows   game_id,play_id,nfl_id,time   10 Hz in-game, rookies only
+Tables (data/processed/)
+------------------------
+players                 510 rows   nfl_id                  bio, draft, combine, career, derived
+games                   1,002 rows game_id                 includes PRE and POST games
+plays                   314k rows  game_id,play_id,nfl_id  player_play + game context + derived
+combine_tracking        ~431k rows event_id,nfl_id,frame   10 Hz Combine drills, PLAYER rows only
+combine_ball            ~32k rows  event_id,nfl_id,frame   Combine ball frames (WR/TE drills)
+game_tracking_{season}  3.7M / 7.8M / 11.2M rows           10 Hz in-game, rookies only (no ball,
+                                                           no opponents)
+
+Nothing is filtered at build time. Preseason/postseason, truncated reps and plays killed
+pre-snap are flagged (season_type, truncated_rep, pre_snap_dead, has_play_row, ...): choose
+filters here, at load time. Everything returns lazy frames except players(); filter early.
 """
 
 from collections.abc import Iterable
@@ -18,7 +22,6 @@ import polars as pl
 
 DATA_DIR = Path(__file__).resolve().parents[2] / "data" / "processed"
 SEASONS = (2023, 2024, 2025)
-FIELD_LENGTH, FIELD_WIDTH = 120.0, 53.3
 
 
 def _path(name: str) -> Path:
@@ -32,78 +35,73 @@ def _path(name: str) -> Path:
     return path
 
 
+def _as_list(v: str | Iterable[str]) -> list[str]:
+    return [v] if isinstance(v, str) else list(v)
+
+
 def load(name: str) -> pl.LazyFrame:
-    """Lazy-load any table by name, e.g. load("players"). Call .collect() to materialise."""
+    """Lazy-load any processed table by name, e.g. load("plays"). Call .collect() to materialise."""
     return pl.scan_parquet(_path(name))
 
 
-def player_cohort() -> pl.DataFrame:
-    """One row per prospect: players + combine_results + player_career_successes."""
-    return (
-        load("players")
-        .join(load("combine_results").drop("draft_year"), on="nfl_id", how="left")
-        .join(load("player_career_successes"), on="nfl_id", how="left")
-        .collect()
-    )
+def players() -> pl.DataFrame:
+    """One row per prospect (510): players + combine_results + career + derived columns."""
+    return load("players").collect()
 
 
-def load_combine_tracking(
-    drill_type: str | Iterable[str] | None = None, players_only: bool = True
-) -> pl.LazyFrame:
-    """Combine drill tracking with a per-attempt `frame` index (0, 1, 2, ... at 10 Hz).
-
-    drill_type: e.g. "THREE_CONE_DRILL" or ["SKILL_DRILLS_WR", "SKILL_DRILLS_DB"].
-    """
-    lf = load("combine_tracking")
-    if players_only:
-        lf = lf.filter(pl.col("entity_type") == "PLAYER")
-    if drill_type is not None:
-        types = [drill_type] if isinstance(drill_type, str) else list(drill_type)
-        lf = lf.filter(pl.col("drill_type").is_in(types))
-    return lf.sort("event_id", "nfl_id", "time").with_columns(
-        frame=pl.int_range(pl.len()).over("event_id", "nfl_id")
-    )
+player_cohort = players  # backwards-compatible name
 
 
-def load_game_tracking(
-    seasons: int | Iterable[int] = SEASONS, standardize: bool = True
-) -> pl.LazyFrame:
-    """In-game tracking for the chosen season(s), with `season` and a per-play `frame` index.
-
-    standardize=True joins `play_direction` from player_play and flips plays so the
-    offense always moves toward +x (x -> 120-x, y -> 53.3-y, angles +180).
-    Tracking is ~9M rows across seasons: filter early (by nfl_id / game_id) and stay lazy.
-    """
-    seasons = [seasons] if isinstance(seasons, int) else list(seasons)
-    lf = pl.concat(
-        [
-            pl.scan_parquet(_path(f"game_tracking_{s}")).with_columns(season=pl.lit(s))
-            for s in seasons
-        ]
-    )
-    lf = lf.sort("game_id", "play_id", "nfl_id", "time").with_columns(
-        frame=pl.int_range(pl.len()).over("game_id", "play_id", "nfl_id")
-    )
-    if standardize:
-        directions = load("player_play").select("game_id", "play_id", "play_direction").unique()
-        lf = standardize_direction(lf.join(directions, on=["game_id", "play_id"], how="left"))
+def load_plays(regular_only: bool = False, live_only: bool = False) -> pl.LazyFrame:
+    """Player-play rows. regular_only keeps REG games; live_only drops plays killed pre-snap."""
+    lf = load("plays")
+    if regular_only:
+        lf = lf.filter(pl.col("season_type") == "REG")
+    if live_only:
+        lf = lf.filter(~pl.col("pre_snap_dead"))
     return lf
 
 
-def standardize_direction(lf: pl.LazyFrame, dir_col: str = "play_direction") -> pl.LazyFrame:
-    """Flip plays moving left so offense always moves toward +x."""
-    cols = lf.collect_schema().names()
-    left = pl.col(dir_col) == "left"
-    exprs = [
-        pl.when(left).then(FIELD_LENGTH - pl.col("x")).otherwise(pl.col("x")).alias("x"),
-        pl.when(left).then(FIELD_WIDTH - pl.col("y")).otherwise(pl.col("y")).alias("y"),
-    ]
-    for angle in ("o", "dir"):
-        if angle in cols:
-            exprs.append(
-                pl.when(left)
-                .then((pl.col(angle) + 180) % 360)
-                .otherwise(pl.col(angle))
-                .alias(angle)
-            )
-    return lf.with_columns(exprs)
+def load_combine_tracking(
+    drill_type: str | Iterable[str] | None = None,
+    drill_name: str | Iterable[str] | None = None,
+    include_truncated: bool = True,
+) -> pl.LazyFrame:
+    """Combine drill tracking (PLAYER rows), with per-attempt `frame` and `t` (seconds).
+
+    drill_type: e.g. "THREE_CONE_DRILL" or ["SKILL_DRILLS_WR", "SKILL_DRILLS_DB"].
+    drill_name: normalised names, e.g. "PASS_PRO_MIRROR_DRILL".
+    Use `dis` (recomputed from x/y), not `dis_raw`. Coordinates are the Combine frame,
+    not a game field: don't apply game-field standardisation.
+    """
+    lf = load("combine_tracking")
+    if drill_type is not None:
+        lf = lf.filter(pl.col("drill_type").cast(pl.String).is_in(_as_list(drill_type)))
+    if drill_name is not None:
+        lf = lf.filter(pl.col("drill_name").cast(pl.String).is_in(_as_list(drill_name)))
+    if not include_truncated:
+        lf = lf.filter(~pl.col("truncated_rep"))
+    return lf
+
+
+def load_game_tracking(
+    seasons: int | Iterable[int] = SEASONS,
+    regular_only: bool = False,
+    play_columns: Iterable[str] | None = None,
+) -> pl.LazyFrame:
+    """In-game tracking for the chosen season(s).
+
+    Coordinates: x_std/y_std/o_std/dir_std are standardised so the offense moves toward +x
+    (null where the play direction is unknown); raw x/y/o/dir are kept alongside.
+    `t_since_snap` is seconds relative to the ball_snap event (negative = pre-snap).
+    play_columns: extra columns to join from `plays`, e.g. ["route_ran", "pass_result"].
+    ~22.6M rows across seasons: filter early (nfl_id / game_id) and stay lazy.
+    """
+    seasons = [seasons] if isinstance(seasons, int) else list(seasons)
+    lf = pl.concat([load(f"game_tracking_{s}") for s in seasons], how="vertical_relaxed")
+    if regular_only:
+        lf = lf.filter(pl.col("season_type") == "REG")
+    if play_columns:
+        keys = ["game_id", "play_id", "nfl_id"]
+        lf = lf.join(load("plays").select(*keys, *play_columns), on=keys, how="left")
+    return lf

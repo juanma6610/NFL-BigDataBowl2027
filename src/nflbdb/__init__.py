@@ -6,8 +6,9 @@ from nflbdb.io import (
     load,
     load_combine_tracking,
     load_game_tracking,
+    load_plays,
     player_cohort,
-    standardize_direction,
+    players,
 )
 
 __all__ = [
@@ -16,6 +17,7 @@ __all__ = [
     "load",
     "load_combine_tracking",
     "load_game_tracking",
+    "load_plays",
     "player_cohort",
-    "standardize_direction",
+    "players",
 ]
