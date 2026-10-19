@@ -1,0 +1,15 @@
+{
+  "id": "juanmaoliver/football-101-a-visual-starter-for-bdb-2027",
+  "title": "🏈 Football 101: A Visual Starter for BDB 2027",
+  "code_file": "Football101.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": [],
+  "competition_sources": ["nfl-big-data-bowl-2027"],
+  "kernel_sources": [],
+  "model_sources": []
+}
