@@ -4,7 +4,7 @@ Principles
 ----------
 - Raw CSVs are never modified; every output can be rebuilt from them with one command.
 - Fix what is objectively wrong: dtypes, duplicate drill names, the Combine `dis` column,
-  BALL rows mixed into player tracking, a typo'd column name.
+  BALL rows mixed into player tracking, a typo'd column name, the Rams' two team codes.
 - Flag, don't drop: preseason/postseason, truncated reps, plays killed pre-snap, Combine
   opt-outs and unmatched join keys all stay in, with a column that says so. Filtering is
   an analysis decision, made at load time.
@@ -67,6 +67,9 @@ TRUNCATED_DRILLS = {(2024, "BACK_PEDAL_AND_TRANSITION_45_DEGREE_REACTION")}
 
 ID_TYPES = {"game_id": I64, "play_id": I32, "nfl_id": I32, "draft_year": I16, "season": I16}
 COLUMN_FIXES = {"visitor_team_win_probility_added": "visitor_team_win_probability_added"}
+# The Rams are "LA" in 2023-24 and "LAR" in 2025: one team, 33 codes. Left -> right.
+TEAM_FIXES = {"LA": "LAR"}
+TEAM_COLS = ["team_abbr", "possession_team", "yardline_side", "home_team_abbr", "visitor_team_abbr"]
 COMBINE_TESTS = [
     "ten_yd_split", "forty", "vertical", "broad_jump", "three_cone", "short_shuttle", "bench_reps",
 ]  # fmt: skip
@@ -125,6 +128,7 @@ def _read_small(raw: Path, stem: str) -> pl.DataFrame:
         casts.append(pl.col("birth_date").str.to_date("%Y-%m-%d", strict=False))
     # Same key dtypes as the tracking files, so joins never upcast.
     casts += [pl.col(c).cast(t) for c, t in ID_TYPES.items() if c in df.columns]
+    casts += [pl.col(c).replace(TEAM_FIXES) for c in TEAM_COLS if c in df.columns]
     return df.with_columns(casts) if casts else df
 
 
